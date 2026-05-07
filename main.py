@@ -1,57 +1,32 @@
 import requests
 import math
 import os
+import re
+from datetime import datetime
 
-# --- CONFIGURATION ---
 TOKEN = os.getenv('MY_GITHUB_TOKEN')
 URL = 'https://api.github.com/graphql'
 
 def calculate_level(stats):
-    """
-    Calculates XP and a numerical Level.
-    Formula: Level = sqrt(XP / 10)
-    Weights: PRs (5), Reviews (4), Commits (1), Issues (1), Stars (2)
-    """
-    # Extract data with defaults
     commits = stats.get('totalCommitContributions', 0)
     prs = stats.get('totalPullRequestContributions', 0)
     issues = stats.get('totalIssueContributions', 0)
     reviews = stats.get('totalPullRequestReviewContributions', 0)
     stars = stats.get('stars', 0)
-
-    # Calculate total XP
     xp = (commits * 1) + (prs * 5) + (reviews * 4) + (issues * 1) + (stars * 2)
-
-    # Calculate Level based on a curve
-    # Level 1 = 10 XP | Level 10 = 1000 XP | Level 20 = 4000 XP
     level = int(math.sqrt(xp / 10)) if xp > 0 else 0
-    
-    # Calculate XP required for the current and next level
     current_lvl_base = (level ** 2) * 10
     next_lvl_base = ((level + 1) ** 2) * 10
-    xp_needed = next_lvl_base - xp
-    
-    # Progress percentage within the current level
-    progress_pct = (xp - current_lvl_base) / (next_lvl_base - current_lvl_base) if xp > 0 else 0
+    denom = next_lvl_base - current_lvl_base
+    progress_pct = (xp - current_lvl_base) / denom if denom > 0 else 0
+    return {"level": level, "xp": xp, "next_lvl_base": next_lvl_base, "progress_pct": progress_pct}
 
-    return {
-        "level": level,
-        "xp": xp,
-        "xp_needed": xp_needed,
-        "next_lvl_base": next_lvl_base,
-        "progress_pct": progress_pct
-    }
-
-def get_user_dashboard(username):
+def update_readme(username):
     query = """
     query($login: String!) {
       user(login: $login) {
-        name
-        followers { totalCount }
         repositories(first: 100, ownerAffiliations: OWNER, privacy: PUBLIC) {
-          nodes {
-            stargazerCount
-          }
+          nodes { stargazerCount }
         }
         contributionsCollection {
           totalCommitContributions
@@ -62,61 +37,48 @@ def get_user_dashboard(username):
       }
     }
     """
-    
-    variables = {"login": username}
     headers = {"Authorization": f"Bearer {TOKEN}"}
+    response = requests.post(URL, json={'query': query, 'variables': {"login": username}}, headers=headers)
+    data = response.json().get('data', {}).get('user')
     
-    try:
-        response = requests.post(URL, json={'query': query, 'variables': variables}, headers=headers)
-        response.raise_for_status()
-        res_json = response.json()
-        
-        if not res_json.get('data') or not res_json['data']['user']:
-            print(f"Error: User '{username}' not found.")
-            return
+    stats = data['contributionsCollection']
+    total_stars = sum(repo['stargazerCount'] for repo in data['repositories']['nodes'])
+    stats['stars'] = total_stars
+    lvl = calculate_level(stats)
+    
+    bar = "█" * int(20 * lvl['progress_pct']) + "░" * (20 - int(20 * lvl['progress_pct']))
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
 
-        user_data = res_json['data']['user']
-        stats = user_data['contributionsCollection']
-        
-        # Aggregate stars
-        total_stars = sum(repo['stargazerCount'] for repo in user_data['repositories']['nodes'])
-        stats['stars'] = total_stars 
+    # The new stats block
+    new_stats = f"""
+### 📊 Developer Stats
+| Metric | Value |
+| :--- | :--- |
+| **Current Level** | {lvl['level']} |
+| **Total XP** | {lvl['xp']} / {lvl['next_lvl_base']} |
+| **Commits** | {stats['totalCommitContributions']} |
+| **PRs** | {stats['totalPullRequestContributions']} |
+| **Reviews** | {stats['totalPullRequestReviewContributions']} |
+| **Issues** | {stats['totalIssueContributions']} |
+| **Stars** | {total_stars} |
 
-        # Level Logic
-        lvl_data = calculate_level(stats)
-        
-        # Create Progress Bar
-        bar_length = 20
-        filled_length = int(bar_length * lvl_data['progress_pct'])
-        bar = "█" * filled_length + "░" * (bar_length - filled_length)
+**Progress:** `Level {lvl['level']}` **[{bar}]** `Level {lvl['level'] + 1}`
+*Last updated: {timestamp}*
+"""
 
-        # Output
-        print(f"\n{'='*40}")
-        print(f" {username.upper()}'S DEVELOPER PROFILE")
-        print(f"{'='*40}")
-        print(f"Name:         {user_data['name'] or 'N/A'}")
-        print(f"Level:        {lvl_data['level']}")
-        print(f"XP:           {lvl_data['xp']} / {lvl_data['next_lvl_base']}")
-        print(f"Progress:     [{bar}] {int(lvl_data['progress_pct']*100)}%")
-        print(f"To Next Lvl:  {lvl_data['xp_needed']} XP")
-        print("-" * 40)
-        print(f"Commits:      {stats['totalCommitContributions']}")
-        print(f"PRs:          {stats['totalPullRequestContributions']}")
-        print(f"Reviews:      {stats['totalPullRequestReviewContributions']}")
-        print(f"Issues:       {stats['totalIssueContributions']}")
-        print(f"Stars:        {total_stars}")
-        print(f"Followers:    {user_data['followers']['totalCount']}")
-        print(f"{'='*40}\n")
+    # Read the existing README
+    with open("README.md", "r", encoding="utf-8") as f:
+        readme_contents = f.read()
 
-    except requests.exceptions.RequestException as e:
-        print(f"Request failed: {e}")
+    # Use Regex to find the markers and replace only what's inside
+    pattern = r"(<!-- START_SECTION:dashboard -->)(.*)(<!-- END_SECTION:dashboard -->)"
+    # re.DOTALL allows the .* to match newlines
+    new_readme = re.sub(pattern, f"\\1\n{new_stats}\n\\3", readme_contents, flags=re.DOTALL)
+
+    # Write it back
+    with open("README.md", "w", encoding="utf-8") as f:
+        f.write(new_readme)
 
 if __name__ == "__main__":
-    # Replace with your actual GitHub username
-    # Ensure TOKEN is set at the top of the script
-    target_user = "your-username-here" 
-    
-    if TOKEN == 'YOUR_GITHUB_TOKEN':
-        print("Please set your GitHub Personal Access Token at the top of the script.")
-    else:
-        get_user_dashboard(target_user)
+    user = os.getenv('GITHUB_REPOSITORY_OWNER')
+    update_readme(user)

@@ -1,14 +1,18 @@
 import requests
+import math
+import os
 
-TOKEN = 'YOUR_GITHUB_TOKEN'
+# --- CONFIGURATION ---
+TOKEN = os.getenv('MY_GITHUB_TOKEN')
 URL = 'https://api.github.com/graphql'
 
 def calculate_level(stats):
     """
-    Calculates XP and Rank based on contribution metrics.
+    Calculates XP and a numerical Level.
+    Formula: Level = sqrt(XP / 10)
     Weights: PRs (5), Reviews (4), Commits (1), Issues (1), Stars (2)
     """
-    # Extract data with defaults to avoid errors
+    # Extract data with defaults
     commits = stats.get('totalCommitContributions', 0)
     prs = stats.get('totalPullRequestContributions', 0)
     issues = stats.get('totalIssueContributions', 0)
@@ -18,17 +22,27 @@ def calculate_level(stats):
     # Calculate total XP
     xp = (commits * 1) + (prs * 5) + (reviews * 4) + (issues * 1) + (stars * 2)
 
-    # Rank Thresholds
-    if xp >= 1000: rank = "S (Grandmaster)"
-    elif xp >= 500: rank = "A (Expert)"
-    elif xp >= 200: rank = "B (Contributor)"
-    elif xp >= 50:  rank = "C (Novice)"
-    else:           rank = "D (Beginner)"
+    # Calculate Level based on a curve
+    # Level 1 = 10 XP | Level 10 = 1000 XP | Level 20 = 4000 XP
+    level = int(math.sqrt(xp / 10)) if xp > 0 else 0
+    
+    # Calculate XP required for the current and next level
+    current_lvl_base = (level ** 2) * 10
+    next_lvl_base = ((level + 1) ** 2) * 10
+    xp_needed = next_lvl_base - xp
+    
+    # Progress percentage within the current level
+    progress_pct = (xp - current_lvl_base) / (next_lvl_base - current_lvl_base) if xp > 0 else 0
 
-    return rank, xp
+    return {
+        "level": level,
+        "xp": xp,
+        "xp_needed": xp_needed,
+        "next_lvl_base": next_lvl_base,
+        "progress_pct": progress_pct
+    }
 
 def get_user_dashboard(username):
-    # Added 'totalPullRequestReviewContributions' and a nested star count
     query = """
     query($login: String!) {
       user(login: $login) {
@@ -52,39 +66,57 @@ def get_user_dashboard(username):
     variables = {"login": username}
     headers = {"Authorization": f"Bearer {TOKEN}"}
     
-    response = requests.post(URL, json={'query': query, 'variables': variables}, headers=headers)
-    
-    if response.status_code == 200:
+    try:
+        response = requests.post(URL, json={'query': query, 'variables': variables}, headers=headers)
+        response.raise_for_status()
         res_json = response.json()
+        
         if not res_json.get('data') or not res_json['data']['user']:
-            print("User not found.")
+            print(f"Error: User '{username}' not found.")
             return
 
         user_data = res_json['data']['user']
         stats = user_data['contributionsCollection']
         
-        # Calculate total stars across all public owned repos
+        # Aggregate stars
         total_stars = sum(repo['stargazerCount'] for repo in user_data['repositories']['nodes'])
-        stats['stars'] = total_stars # Injecting stars into stats for the level calculator
+        stats['stars'] = total_stars 
 
-        # Get the level
-        rank, xp = calculate_level(stats)
-        density = stats['totalCommitContributions'] / max(stats['totalPullRequestContributions'], 1)
+        # Level Logic
+        lvl_data = calculate_level(stats)
         
-        print(f"--- {username}'s Developer Dashboard ---")
-        print(f"Real Name:    {user_data['name']}")
-        print(f"Total XP:     {xp}")
-        print(f"Current Rank: {rank}")
-        print("-" * 30)
+        # Create Progress Bar
+        bar_length = 20
+        filled_length = int(bar_length * lvl_data['progress_pct'])
+        bar = "█" * filled_length + "░" * (bar_length - filled_length)
+
+        # Output
+        print(f"\n{'='*40}")
+        print(f" {username.upper()}'S DEVELOPER PROFILE")
+        print(f"{'='*40}")
+        print(f"Name:         {user_data['name'] or 'N/A'}")
+        print(f"Level:        {lvl_data['level']}")
+        print(f"XP:           {lvl_data['xp']} / {lvl_data['next_lvl_base']}")
+        print(f"Progress:     [{bar}] {int(lvl_data['progress_pct']*100)}%")
+        print(f"To Next Lvl:  {lvl_data['xp_needed']} XP")
+        print("-" * 40)
         print(f"Commits:      {stats['totalCommitContributions']}")
-        print(f"PRs Opened:   {stats['totalPullRequestContributions']}")
-        print(f"Code Reviews: {stats['totalPullRequestReviewContributions']}")
+        print(f"PRs:          {stats['totalPullRequestContributions']}")
+        print(f"Reviews:      {stats['totalPullRequestReviewContributions']}")
         print(f"Issues:       {stats['totalIssueContributions']}")
-        print(f"Stars Earned: {total_stars}")
+        print(f"Stars:        {total_stars}")
         print(f"Followers:    {user_data['followers']['totalCount']}")
-        print(f"Commit Density: {density:.1f} commits per PR")
-    else:
-        print(f"Error: {response.status_code} - {response.text}")
+        print(f"{'='*40}\n")
+
+    except requests.exceptions.RequestException as e:
+        print(f"Request failed: {e}")
 
 if __name__ == "__main__":
-    get_user_dashboard("your username here")
+    # Replace with your actual GitHub username
+    # Ensure TOKEN is set at the top of the script
+    target_user = "your-username-here" 
+    
+    if TOKEN == 'YOUR_GITHUB_TOKEN':
+        print("Please set your GitHub Personal Access Token at the top of the script.")
+    else:
+        get_user_dashboard(target_user)
